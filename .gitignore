@@ -1,0 +1,61 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+paper/
+docs/
+out/
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE and notebook state
+.vscode/
+.idea/
+.ipynb_checkpoints/
+*.swp
+*~
+.claude/
+.codex/
+.agents/
+
+
+# Slurm 作业产物 —— 它们跟代码无关, 不该让工作树变脏
+slurm-*.out
+slurm-*.err
+/logs/
+
+# Training runs, generated caches, and evaluation outputs
+/log/
+/outputs/
+/uprmvs_outputs/
+/models/fast_gicp/vcpkg/
+/models/sam3
+/models/PDA/
+/experiments/
+# Model checkpoints and exported weights
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.png
+*.md
+*.log
+*.npz
+*.csv
+*.yml
+!docs/current_code_dataflow_guide_zh.md
+# Local generated visualizations
+/depth_map_000_vis.png
+
+# OS metadata
+.DS_Store
+Thumbs.db
