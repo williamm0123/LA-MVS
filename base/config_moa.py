@@ -82,7 +82,9 @@ class MoAConfig:
     # Stage 4 searches an already narrow window, where a local affine cannot be
     # exact on the true surface, so its residual shape error is noise rather
     # than a correction — MoA keeps the coarse stages and steps back at the end.
-    moa_gain: tuple[float, float, float] = (1.0, 0.7, 0.3)
+    # LAPE-GRU: (1, 1, 1). The cap suppressed the monocular experts at every transition
+    # (inference ablation on the LAPE 10k checkpoint: abs_err 2.798 -> 2.705 with no cap).
+    moa_gain: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # Per transition: at a DA3 depth edge, snap the centre to whichever of
     # {MVS centre, monocular surface} the mixture already leans to, instead of
     # blending them. A blend of a foreground and a background estimate lands on
@@ -148,9 +150,10 @@ class LAPEConfig:
     nce_dilation: tuple[int, int, int, int] = (1, 1, 2, 1)
     nce_radius: int = 2                         # 5x5 neighbourhood
     nce_kappa_init: float = 0.25
-    # (4) low-frequency recall, per transition (->stage 2/3/4). Off at the last one: its
-    # window is ~0.2 stage-1 bins wide, finer than DA3 is accurate after any alignment.
-    lfr: bool = True
+    # (4) low-frequency recall, per transition (->stage 2/3/4). Off in LAPE-GRU: the hard
+    # re-centre on the RAC depth hurt (ablation: abs_err 2.798 -> 2.782 without it), and the
+    # GRU expert, which sees the matching evidence along the mono depth, replaces it.
+    lfr: bool = False
     lfr_levels: tuple[bool, bool, bool] = (True, True, False)
     lfr_tau_rgb: float = 0.5
     lfr_tau_mono: float = 0.25
@@ -172,6 +175,22 @@ class LAPEConfig:
     reliable_mass: float = 0.9                  # v_M: posterior mass within +-1 bin of the argmax
     reliable_src_std: float = 1.0               # v_M: normalised source disagreement at the argmax
     reliable_nvalid: float = 0.5                # v_M: fraction of sources that see the argmax voxel
+    # (6) LAPE-GRU (models/moa/affine_gru.py): ConvGRU iterations on the centred local affine
+    # (alpha, b~) per level 0..3, added as the 5th monocular expert. 0 iterations = the
+    # inverse-variance mix of the window experts (no GRU module at that level).
+    gru: bool = True
+    gru_iters: tuple[int, int, int, int] = (4, 4, 3, 0)
+    gru_hidden: int = 64
+    gru_radius: int = 2                         # matching lookups at x + k * parent spacing, |k| <= r
+    gru_alpha_step: float = 0.1                 # largest |d alpha| per iteration
+    gru_b_step_bins: float = 2.0                # largest |d b~| per iteration, parent spacings
+    # (7) final refinement (models/moa/refine.py): 1/2-res ConvGRU on the stage-4 depth,
+    # re-sweeping 2r+1 candidates per iteration, residual convex-upsampled to full res.
+    refine: bool = True
+    refine_iters: int = 4
+    refine_hidden: int = 64
+    refine_radius: int = 2
+    refine_warp_channels: int = 32
 
 
 @dataclass(frozen=True)
@@ -188,6 +207,15 @@ class MoALossConfig:
     w_sigma_nll: float = 0.1
     sigma_nll_cap_bins: float = 20.0            # residuals beyond this (stage-1 bins) are capped
     sigma_nll_huber: float = 3.0                # NLL tails become linear beyond this many sigma
+    # LAPE-GRU
+    w_prior_mix: float = 0.1                    # mixture NLL of the monocular prior (trains its weights)
+    w_gru: float = 1.0                          # sequence loss of the GRU expert (parent resolution)
+    w_gru_child: float = 0.5                    # GRU field lifted onto the child-res DA3 (trains alpha)
+    w_gru_tv: float = 0.02                      # edge-aware smoothness of (alpha, b~/D1)
+    gru_gamma: float = 0.8                      # sequence weights gamma^(T-1-t)
+    w_refine: float = 2.0                       # final refinement, sequence loss at full resolution
+    w_refine_conf: float = 0.2
+    refine_cap: float = 8.0                     # supervise where |stage4 - GT| <= this many stage-4 spacings
 
 
 @dataclass(frozen=True)
@@ -267,6 +295,8 @@ LEGACY_SECTIONS = {
     "feat": FeatureConfig(backbone="dinov3"),
     "lape": LAPEConfig(enabled=False),
 }
+# Fields whose absence in a snapshot means "trained before this module existed".
+LEGACY_FIELDS = {("lape", "gru"): False, ("lape", "refine"): False}
 
 
 def _to_plain(v):
@@ -317,6 +347,11 @@ def apply_arch_snapshot(cfg: MoAMVSConfig, snapshot: dict) -> MoAMVSConfig:
     was never trained with.
     """
     hints = typing.get_type_hints(MoAMVSConfig)
+    snapshot = {k: (dict(v) if isinstance(v, dict) else v) for k, v in snapshot.items()}
+    for (sec, fname), val in LEGACY_FIELDS.items():
+        if sec in snapshot and fname not in snapshot[sec]:
+            snapshot[sec][fname] = val
+            print(f"[config] 快照没有 {sec}.{fname} (旧 checkpoint): 按 {val!r} 重建")
     upd = {name: _from_dict(hints[name], snapshot[name]) for name in ARCH_SECTIONS if name in snapshot}
     legacy = {name: LEGACY_SECTIONS[name] for name in LEGACY_SECTIONS if name not in snapshot}
     if legacy:

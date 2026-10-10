@@ -14,6 +14,11 @@
           LAPE level s-1: RAC + experts + MoA mixture + low-frequency recall -> centre
           window around the centre (not forced to hold the MVS centre where LFR fired)
           cost volume (+ normal evidence for s <= 3) + prior adapter -> 3D UNet -> + gamma*log q
+      every LAPE level also runs LAPE-GRU (cfg.lape.gru): a ConvGRU iterates the monocular
+      local affine (alpha, b~) against the window sums and the parent matching evidence,
+      giving a 5th monocular expert (models/moa/affine_gru.py)
+      refine (cfg.lape.refine): 1/2-res ConvGRU on the stage-4 depth with per-iteration
+      re-sweeps, residual convex-upsampled to full res -> depth_full (models/moa/refine.py)
     MoA (cfg.lape.enabled = False): the previous cascade — the prior only sets centres.
 
 Every stage's depth still comes from its own posterior; the prior shifts which candidate
@@ -87,6 +92,7 @@ class MoAMVSNet(nn.Module):
 
         self.lape_on = bool(self.cfg.moa.enabled and self.cfg.lape.enabled)
         self.moa = None
+        self.refiner = None
         if self.lape_on:
             from models.moa.lape import LAPECascade
             from models.moa.normal_evidence import NormalEvidence
@@ -108,6 +114,11 @@ class MoAMVSNet(nn.Module):
             self.prior_adapters = nn.ModuleList(PriorAdapter(cc.num_groups) for _ in range(4))
             self.gamma_heads = nn.ModuleList(
                 GammaHead(gamma_max=lc.gamma_max, bias_init=lc.gamma_bias_init) for _ in range(4))
+            if lc.refine:
+                from models.moa.refine import DepthRefiner
+                self.refiner = DepthRefiner(fpn_c, cc.num_groups, warp_channels=lc.refine_warp_channels,
+                                            hidden=lc.refine_hidden, radius=lc.refine_radius,
+                                            iters=lc.refine_iters, use_half=cc.warp_use_half)
         elif self.cfg.moa.enabled:
             from models.moa.moa import MoACascade
             self.moa = MoACascade(self.cfg.moa, fpn_c, cc.num_groups, cc.num_depths[0])
@@ -286,7 +297,8 @@ class MoAMVSNet(nn.Module):
             lp0 = self.moa(0, mono_depth=mono["depth"], mono_valid=mono["valid"], mono_edge=mono["edge"],
                            gray=gray, z_prev=s1a["depth"].detach(), prob=s1a["prob"].detach(), u_hyp=u1,
                            cv=cvo1.cv.detach(), n_valid=cvo1.n_valid.detach(), src_std=cvo1.src_std.detach(),
-                           num_src=cvo1.num_src, ref_feat=f1[:, 0].detach(), vmin=vmin, vmax=vmax)
+                           num_src=cvo1.num_src, ref_feat=f1[:, 0].detach(), vmin=vmin, vmax=vmax,
+                           logits_raw=s1a["logits_raw"].detach())
             pri = self.moa.lift(lp0, tuple(f1.shape[-2:]), mono["depth"], mono["valid"], vmin, vmax)
             x_in, fuse, store = self._lape_inputs(0, cvo1, u1, pri, K, mono, gray, vmin, vmax, vM1a)
             prev = self._decode(0, x_in, hyp1, u1, cvo1, branch_prior=fuse)
@@ -310,9 +322,10 @@ class MoAMVSNet(nn.Module):
                               gray=gray, z_prev=prev["depth"].detach(), prob=prev["prob"].detach(),
                               u_hyp=prev["u_hypos"].detach(), cv=cvo.cv.detach(), n_valid=cvo.n_valid.detach(),
                               src_std=cvo.src_std.detach(), num_src=cvo.num_src,
-                              ref_feat=feats[self.strides[k - 1]][:, 0].detach(), vmin=vmin, vmax=vmax)
+                              ref_feat=feats[self.strides[k - 1]][:, 0].detach(), vmin=vmin, vmax=vmax,
+                              logits_raw=prev["logits_raw"].detach())
                 center = mo.center_u.detach()
-                lfr = mo.lfr_flag
+                lfr = mo.lfr_flag if self.cfg.lape.lfr else None
             elif self.moa is not None:
                 mo = self.moa(
                     k - 1, mono_depth=mono["depth"], mono_valid=mono["valid"], mono_edge=mono["edge"],
@@ -351,4 +364,8 @@ class MoAMVSNet(nn.Module):
             prev = cur
         prev.pop("_cv")
         out["depth_full"] = out["stage4"]["depth"][:, 0]
+        if self.refiner is not None:
+            rf = self.refiner(feats[self.strides[2]], K, E, out["stage4"], out.get("moa4"), vmin, vmax)
+            out["refine"] = rf
+            out["depth_full"] = rf["depth"][:, 0]
         return out

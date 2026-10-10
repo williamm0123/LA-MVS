@@ -73,7 +73,7 @@ def parse_args(argv=None) -> tuple[argparse.Namespace, list[str]]:
     p.add_argument("--filter", choices=["dynamic", "fixed"], default="dynamic",
                    help="dynamic = test_dtu_dypcd.py (默认); fixed = test_dtu_pcd.py")
     p.add_argument("--conf", type=float, default=None, help="光度门槛, 默认 dynamic 0.55 / fixed 0.6")
-    p.add_argument("--conf-key", choices=["auto", "conf_last", "conf"], default="auto",
+    p.add_argument("--conf-key", choices=["auto", "conf_last", "conf", "conf_refine"], default="auto",
                    help="auto: 有 conf_last 用它, 否则退回四级连乘 conf")
     p.add_argument("--workers", type=int, default=4, help="并行融合的 scan 数")
     p.add_argument("--save-masks", action="store_true", help="写 <out>/mask/<scan>/<ref>_{photo,geo,final}.png")

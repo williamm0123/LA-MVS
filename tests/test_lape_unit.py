@@ -386,3 +386,68 @@ def test_lape_losses_do_not_touch_the_matching_network():
         for p in mod.parameters():
             assert p.grad is None or float(p.grad.abs().max()) == 0.0
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in net.moa.parameters())
+
+
+# --------------------------------------------------------------------------- LAPE-GRU / refinement
+def test_wls_residual_zero_at_closed_form_fit():
+    """The GRU's refit features are the WLS gradient: zero at the experts' own solution."""
+    from models.moa.affine_gru import wls_residual_feats
+    x = _ramp()
+    y = 1.2 * x + 0.03
+    r = _experts(x, y)
+    inner = (slice(None), slice(None), slice(6, -6), slice(6, -6))
+    for s in range(3):
+        f, rms = wls_residual_feats(r.sums[:, s:s + 1], r.alpha[:, s:s + 1], r.bt[:, s:s + 1], DG)
+        assert float(f[:, 0:1][inner].abs().max()) < 1e-3, s        # mean residual
+        assert float(rms[inner].max()) < 1e-4, s
+    f0, _ = wls_residual_feats(r.sums, torch.zeros_like(x), torch.zeros_like(x), DG)
+    assert float(f0[:, 0:3][inner].abs().mean()) > 1e-3             # off the fit: non-zero gradient
+
+
+def test_gru_and_refiner_are_identity_at_init():
+    """Zero-init heads: the GRU expert stays at its expert-mix init, the refinement returns stage 4."""
+    from models.network_moa import MoAMVSNet
+    cfg = _tiny_cfg()
+    net = MoAMVSNet(cfg, da3_net=_StubDA3())
+    net.eval()
+    with torch.no_grad():
+        out = net(_batch())
+    for key in ("lape1", "moa2", "moa3"):
+        lo = out[key]
+        assert lo.mu.shape[1] == 5 and lo.mixture_weights_raw.shape[1] == 6
+        assert torch.allclose(lo.gru_seq[-1], lo.gru_x0, atol=1e-6), key
+    assert out["moa4"].gru_seq == []
+    assert torch.allclose(out["depth_full"], out["stage4"]["depth"][:, 0], rtol=1e-5)
+
+
+def test_gru_losses_train_gru_and_refiner():
+    from losses.moa_loss import MoALoss
+    from models.network_moa import MoAMVSNet
+    cfg = _tiny_cfg()
+    net = MoAMVSNet(cfg, da3_net=_StubDA3())
+    net.train()
+    b = _batch()
+    b["depth_gt"] = torch.full((1, 64, 80), 600.0)
+    b["mask"] = torch.ones(1, 64, 80)
+    out = net(b)
+    loss, logs = MoALoss(cfg.loss, cfg.cascade.num_depths[0])(out, b, diagnostics=True)
+    for k in ("lape1_gru", "moa2_gru", "moa3_gru", "moa2_gru_child", "lape1_mixnll", "refine", "refine_conf"):
+        assert k in logs and torch.isfinite(logs[k]), k
+    loss.backward()
+    # the stub DA3 may leave RAC without a model (no valid mono) for some inits; the GRU
+    # can only be trained where its expert exists
+    for lvl, key in ((0, "lape1"), (1, "moa2"), (2, "moa3")):
+        if bool((out[key].mono_valid > 0.5).any()):
+            head = net.moa.grus[lvl].head[-1].weight
+            assert head.grad is not None and float(head.grad.abs().sum()) > 0, key
+    rh = net.refiner.delta[-1].weight
+    assert rh.grad is not None and float(rh.grad.abs().sum()) > 0
+
+
+def test_snapshot_without_gru_rebuilds_old_lape():
+    from base.config_moa import apply_arch_snapshot, arch_snapshot
+    snap = arch_snapshot(build_moa_config("local"))
+    for k in ("gru", "refine"):
+        snap["lape"].pop(k)
+    cfg = apply_arch_snapshot(build_moa_config("local"), snap)
+    assert cfg.lape.enabled and not cfg.lape.gru and not cfg.lape.refine

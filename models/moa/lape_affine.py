@@ -57,6 +57,7 @@ class WindowExpertResult:
     s_ho: torch.Tensor        # [B,3,H,W] held-out residual scale (u)
     sigma_par: torch.Tensor   # [B,3,H,W] std of the centre prediction from the fit (u)
     delta: torch.Tensor       # [B,3,H,W] radius * (1 - support), a distance proxy (px)
+    sums: torch.Tensor        # [B,3,6,H,W] (Sw, Sx, Sxx, Sd, Sxd, Sdd) per window, detached (LAPE-GRU)
 
 
 def _solve(S, t, lam_a, lam_b, tau_var, det_eps=1e-12):
@@ -144,11 +145,13 @@ class WindowAffineExperts(nn.Module):
 
         outs = {k: [] for k in ("mu", "alpha", "bt", "valid", "offset_only", "support", "n_eff",
                                 "s_ho", "sigma_par", "delta")}
+        sums = []
         la, lb, tv = self.lambda_a, self.lambda_b, self.tau_var
         for s in range(3):
             Se, So = acc[s]
             S = [e + o for e, o in zip(Se, So)]
             Sw, Sx, Sxx, Sd, Sxd, Sdd, S2w, S2x, S2xx = S
+            sums.append(torch.stack(S[:6], dim=1).detach())
             alpha, bt, flat, det_ok, A11, A12, A22, det = _solve(S[:5], x, la, lb, tv)
             # held-out residual: each parity predicts the other
             ae, be, *_ = _solve(Se[:5], x, la, lb, tv)
@@ -193,4 +196,5 @@ class WindowAffineExperts(nn.Module):
             outs["s_ho"].append(s2.clamp_min(0.0).sqrt())
             outs["sigma_par"].append(sig_par)
             outs["delta"].append((RADII[s] * (1.0 - sup)).detach())
-        return WindowExpertResult(**{k: torch.cat(v, dim=1) for k, v in outs.items()})
+        return WindowExpertResult(**{k: torch.cat(v, dim=1) for k, v in outs.items()},
+                                  sums=torch.stack(sums, dim=1)[:, :, :, 0])

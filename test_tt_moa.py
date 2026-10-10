@@ -44,7 +44,7 @@ from data.tnt_moa import MoATnTScene
 from models.network_moa import MoAMVSNet
 from scripts.build_da3_cache_mvs import TNT_SCENES
 from test_dtu import DYNAMIC, FIXED, fuse_scan
-from test_moa import cascade_confidence, last_stage_confidence, valid_depth_cache
+from test_moa import cascade_confidence, last_stage_confidence, refine_confidence, valid_depth_cache
 from train_moa import collate, git_state, load_checkpoint, load_model_state
 
 REPO = Path(__file__).resolve().parent
@@ -155,6 +155,7 @@ def infer(args, scenes) -> dict:
                         fh, depth=pred[0].cpu().numpy(),
                         conf=cascade_confidence(out, args.conf_window)[0].cpu().numpy().astype(np.float32),
                         conf_last=last_stage_confidence(out)[0].cpu().numpy().astype(np.float32),
+                        **refine_confidence(out),
                         K=batch["intrinsics"][0, 0].float().cpu().numpy(),
                         E=batch["extrinsics"][0, 0].float().cpu().numpy(),
                         image=batch["images"][0, 0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy(),

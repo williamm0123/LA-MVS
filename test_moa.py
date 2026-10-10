@@ -102,6 +102,15 @@ def last_stage_confidence(outputs: dict) -> torch.Tensor:
     return pmax[:, 0]
 
 
+def refine_confidence(outputs: dict) -> dict:
+    """LAPE-GRU refinement confidence P(|error| < stage-4 spacing), saved as ``conf_refine``
+    next to ``conf_last`` (fusion still defaults to conf_last; see test_dtu.py --conf-key)."""
+    rf = outputs.get("refine")
+    if rf is None:
+        return {}
+    return {"conf_refine": rf["conf"][0, 0].float().cpu().numpy().astype(np.float32)}
+
+
 def cascade_confidence(outputs: dict, window: int) -> torch.Tensor:
     """Product over the four stages. Stage 4 alone (4 bins) would saturate at 1."""
     hw = outputs["depth_full"].shape[-2:]
@@ -275,6 +284,7 @@ def main(argv=None) -> None:
                         depth=pred[0].cpu().numpy().astype(np.float32),
                         conf=conf[0].cpu().numpy().astype(np.float32),
                         conf_last=last_stage_confidence(out)[0].cpu().numpy().astype(np.float32),
+                        **refine_confidence(out),
                         K=batch["intrinsics"][0, 0].float().cpu().numpy(),
                         E=batch["extrinsics"][0, 0].float().cpu().numpy(),
                         image=batch["images"][0, 0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy(),

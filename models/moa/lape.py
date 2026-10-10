@@ -11,7 +11,11 @@ Built on the MoA transition (models/moa/moa.py), with the changes of the LAPE pl
   has collapsed, the next centre is the region model's depth, the MVS override and
   the edge snap are skipped, and the window is not stretched back to the MVS centre;
 * outputs the prior (mu, sigma, mixture weight, validity) that the network turns
-  into candidate evidence for the next stage (models/moa/prior_evidence.py).
+  into candidate evidence for the next stage (models/moa/prior_evidence.py);
+* (6) LAPE-GRU (models/moa/affine_gru.py): a ConvGRU iterates the centred local
+  affine (alpha, b~) from the experts' inverse-variance mix, refitting against the
+  window sums and looking up the parent matching evidence at the current mono depth
+  each step. Its result is the 5th monocular expert E_gru (mixture: 6 experts).
 
 ``level`` 0 = stage-1 prior (same resolution, no centre); 1..3 = the transitions
 that produce the centres of stages 2..4. Every MVS-derived input is detached, as in
@@ -26,6 +30,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from models.moa.affine_gru import AffineGRU, inverse_variance_init
 from models.moa.calibrator import SigmaCalibrator, calibrated_sigma
 from models.moa.edge import NeighborhoodBarrier, downsample_edge
 from models.moa.evidence import (
@@ -40,15 +45,15 @@ from models.moa.lape_affine import WindowAffineExperts, expert_offsets
 from models.moa.local_affine import ShapeEncoder
 from models.moa.low_freq_recall import OFFSETS7, low_freq_recall
 from models.moa.mixture import (
-    NUM_EXPERTS, MixtureHead, apply_mvs_override, depth_conflict, mono_proposal, prob_conflict,
+    MixtureHead, apply_mvs_override, depth_conflict, mono_proposal, prob_conflict,
     scale_mono_weights, shape_conflict, soft_or,
 )
 from models.moa.prior_evidence import normalized_weights
 from models.moa.rac import RACAligner
 
 NUM_LEVELS = 4
-NUM_MONO = 4          # E_RAC, E3, E7, E11
-MONO_NAMES = ("rac", "w3", "w7", "w11")
+NUM_MONO = 4          # calibrated experts E_RAC, E3, E7, E11 (+ E_gru when lape.gru)
+MONO_NAMES = ("rac", "w3", "w7", "w11", "gru")
 
 
 @dataclass
@@ -93,15 +98,23 @@ class LAPEOutput:
     lfr_flag: torch.Tensor | None = None      # [B,1,h,w] bool
     lfr_soft: torch.Tensor | None = None
     mono_valid: torch.Tensor | None = None
+    # LAPE-GRU (grad -> GRU only); gru_child_* are filled by lift()
+    gru_alpha: torch.Tensor | None = None     # [B,1,h,w]
+    gru_bt: torch.Tensor | None = None        # [B,1,h,w]
+    gru_seq: list | None = None               # x + b~ after every iteration
+    gru_x0: torch.Tensor | None = None        # x + b~ of the initial (expert-mix) state
+    gru_child_u: torch.Tensor | None = None   # the field applied to the child-res DA3
+    gru_child_valid: torch.Tensor | None = None
 
 
 class _LevelAdapter(nn.Module):
-    def __init__(self, cfg, fpn_channels: int, num_groups: int, mix_in: int) -> None:
+    def __init__(self, cfg, fpn_channels: int, num_groups: int, mix_in: int, n_experts: int) -> None:
         super().__init__()
         self.feat_proj = nn.Conv2d(fpn_channels, cfg.feat_dim, 1)
         self.evidence = MVSEvidenceEncoder(num_groups, dim=cfg.evidence_dim, hidden=cfg.evidence_hidden)
         self.conf = MVSConfidenceHead(cfg.evidence_dim, hidden=cfg.conf_hidden)
-        self.mixture = MixtureHead(mix_in, hidden=cfg.mix_hidden, mvs_bias_init=cfg.mvs_bias_init)
+        self.mixture = MixtureHead(mix_in, hidden=cfg.mix_hidden, mvs_bias_init=cfg.mvs_bias_init,
+                                   n_experts=n_experts)
 
 
 class LAPECascade(nn.Module):
@@ -123,14 +136,24 @@ class LAPECascade(nn.Module):
         self.rac = RACAligner(tau=cfg.global_ransac_tau, min_eff=cfg.global_min_eff,
                               max_models=lcfg.rac_max_models, a_ratio=tuple(lcfg.rac_a_ratio),
                               min_frac=lcfg.rac_min_frac)
-        # emb + F_mvs + 4 offsets + 4 posterior stats + 3x(support, valid, offset_only)
-        # + 4x(PV ratio, inside, evidence distance) + mono_valid + edge + 4 log(sigma/du)
+        self.use_gru = bool(lcfg.gru)
+        J = NUM_MONO + int(self.use_gru)
+        self.num_mono = J
+        # emb + F_mvs + J offsets + 4 posterior stats + 3x(support, valid, offset_only)
+        # + Jx(PV ratio, inside, evidence distance) + mono_valid + edge + J log(sigma/du)
         # + RAC supported + RAC split
-        mix_in = cfg.emb_dim + cfg.evidence_dim + 4 + 4 + 9 + 12 + 2 + 4 + 2
+        mix_in = cfg.emb_dim + cfg.evidence_dim + J + 4 + 9 + 3 * J + 2 + J + 2
         self.adapters = nn.ModuleList(
-            _LevelAdapter(cfg, fpn_channels, num_groups, mix_in) for _ in range(NUM_LEVELS))
+            _LevelAdapter(cfg, fpn_channels, num_groups, mix_in, 1 + J) for _ in range(NUM_LEVELS))
         self.calibrators = nn.ModuleList(
             nn.ModuleList(SigmaCalibrator() for _ in range(NUM_MONO)) for _ in range(NUM_LEVELS))
+        self.grus = None
+        if self.use_gru:
+            ctx_in = cfg.emb_dim + cfg.evidence_dim + cfg.feat_dim
+            self.grus = nn.ModuleList(
+                AffineGRU(num_groups, ctx_in, hidden=lcfg.gru_hidden, radius=lcfg.gru_radius,
+                          alpha_step=lcfg.gru_alpha_step, b_step_bins=lcfg.gru_b_step_bins)
+                if int(lcfg.gru_iters[i]) > 0 else nn.Identity() for i in range(NUM_LEVELS))
 
     def _maybe_ckpt(self, fn, *args):
         if self.training and torch.is_grad_enabled():
@@ -138,17 +161,20 @@ class LAPECascade(nn.Module):
         return fn(*args)
 
     def forward(self, level: int, *, mono_depth, mono_valid, mono_edge, gray, z_prev, prob, u_hyp, cv,
-                n_valid, src_std, num_src: int, ref_feat, vmin, vmax) -> LAPEOutput:
+                n_valid, src_std, num_src: int, ref_feat, vmin, vmax, logits_raw=None) -> LAPEOutput:
+        """``logits_raw``: the parent stage's pre-fusion logits, the GRU's matching lookup
+        (``prob`` is used when absent)."""
         dev = z_prev.device
+        lr = logits_raw.detach().float() if logits_raw is not None else None
         with torch.autocast(device_type=dev.type, enabled=False):
             return self._forward(
                 int(level), mono_depth.detach().float(), mono_valid.detach().float(), mono_edge.detach().float(),
                 gray.detach().float(), z_prev.detach().float(), prob.detach().float(), u_hyp.detach().float(),
                 cv.detach().float(), n_valid.detach().float(), src_std.detach().float(), int(num_src),
-                ref_feat.detach().float(), vmin.float(), vmax.float())
+                ref_feat.detach().float(), vmin.float(), vmax.float(), lr)
 
     def _forward(self, level, mono_depth, mono_valid, mono_edge, gray, z_prev, prob, u_hyp, cv,
-                 n_valid, src_std, num_src, ref_feat, vmin, vmax) -> LAPEOutput:
+                 n_valid, src_std, num_src, ref_feat, vmin, vmax, logits_raw=None) -> LAPEOutput:
         cfg, lc = self.cfg, self.lcfg
         ad = self.adapters[level]
         want_center = level > 0
@@ -172,7 +198,8 @@ class LAPECascade(nn.Module):
         curv = pv_curvature(prob)
         nvf = n_valid / float(max(num_src, 1))
         ssn = normalize_src_std(src_std, cv)
-        V, F_mvs = self._maybe_ckpt(ad.evidence, normalize_cost(cv), prob, curv, nvf, ssn)
+        cv_n = normalize_cost(cv)
+        V, F_mvs = self._maybe_ckpt(ad.evidence, cv_n, prob, curv, nvf, ssn)
         sig_bins = st["sigma_u"] / (du + 1e-8)
         stats = torch.cat([st["pmax"], st["entropy"], st["gap"], gather_depth(curv, idx),
                            sig_bins.clamp(max=50.0), gather_depth(nvf, idx), gather_depth(ssn, idx)], dim=1)
@@ -194,9 +221,10 @@ class LAPECascade(nn.Module):
         lap = laplacian(x, xv)
         onehot = torch.zeros(B, NUM_LEVELS, *hw, device=x.device)
         onehot[:, level] = 1.0
+        fproj = ad.feat_proj(ref_feat)
         shape_in = torch.cat([
             x * xvf, (gx / dg).clamp(-10, 10), (gy / dg).clamp(-10, 10), (lap / dg).clamp(-10, 10),
-            em.clamp(0.0, 1.0), xvf, onehot, ad.feat_proj(ref_feat)], dim=1)
+            em.clamp(0.0, 1.0), xvf, onehot, fproj], dim=1)
         emb = self.shape(shape_in)
 
         # ---- (2) window experts + E_RAC -------------------------------------------
@@ -222,6 +250,31 @@ class LAPECascade(nn.Module):
             sig.append(sj)
             feats.append(fj)
         sigma = torch.cat(sig, dim=1)
+
+        # ---- (6) LAPE-GRU: iterate the centred affine (alpha, b~) -----------------
+        g = None
+        if self.use_gru:
+            floor = lc.sigma_floor_bins * dg
+            zero = torch.zeros_like(x)
+            a0, b0, s0 = inverse_variance_init(
+                torch.cat([zero, we.alpha.detach()], 1), torch.cat([zero, we.bt.detach()], 1),
+                sigma.detach(), valid4.detach(), floor)
+            gru = self.grus[level]
+            if isinstance(gru, AffineGRU):
+                post = torch.softmax(logits_raw, dim=1) if logits_raw is not None else prob
+                vol = torch.cat([cv_n, post.unsqueeze(1)], dim=1)
+                ctx = torch.cat([emb, F_mvs, fproj], dim=1)
+                g = gru(int(lc.gru_iters[level]), x=x, xv=xvf, y=y, du=du, dg=dg, sums=we.sums,
+                        support=we.support, vol=vol, u_hyp=u_hyp, ctx=ctx, a0=a0, b0=b0, s0=s0,
+                        edge=edge_bin, r=r_anchor, mu_e=mu.detach(), sig_e=sigma.detach(),
+                        val_e=valid4.detach(), a_lim=(cfg.a_range[0] - 1.0, cfg.a_range[1] - 1.0),
+                        b_max=cfg.b_max, floor=floor)
+                ga, gb, gs, seq = g.alpha, g.bt, g.sigma, g.seq
+            else:
+                ga, gb, gs, seq = a0, b0, s0, []
+            mu = torch.cat([mu, x + gb.detach()], dim=1)
+            valid4 = torch.cat([valid4, xvf], dim=1)
+            sigma = torch.cat([sigma, gs], dim=1)
         sig_d = sigma.detach()
 
         # ---- mixture --------------------------------------------------------------
@@ -232,7 +285,7 @@ class LAPECascade(nn.Module):
         pmax = st["pmax"]
         V_peak = gather_depth(V, idx)
         pv_r, ins, dist = [], [], []
-        for j in range(1, NUM_EXPERTS):
+        for j in range(1, experts.shape[1]):
             e_j = experts[:, j:j + 1]
             pv_j, in_j = interp_along_axis(prob, u_hyp, e_j)
             V_j, _ = interp_along_axis(V, u_hyp, e_j)
@@ -256,6 +309,8 @@ class LAPECascade(nn.Module):
             rac_supported=rac.supported, rac_delta=rac.delta, rac_split=rac.split, global_ok=rac.primary_ok,
             mvs_u=y, du=du, mvs_confidence=r, mvs_conf_logit=r_logit, edge=edge_bin,
             mixture_weights_raw=pi, experts_u=experts, mono_valid=xvf)
+        if self.use_gru:
+            out.gru_alpha, out.gru_bt, out.gru_seq, out.gru_x0 = ga, gb, seq, (x + b0).detach()
         if not want_center:
             return out
 
@@ -301,12 +356,26 @@ class LAPECascade(nn.Module):
         out.lfr_soft = lfr_soft
         return out
 
-    @torch.no_grad()
     def lift(self, out: LAPEOutput, child_hw: tuple[int, int], mono_depth: torch.Tensor,
              mono_valid: torch.Tensor, vmin: torch.Tensor, vmax: torch.Tensor) -> dict:
         """The prior on the child grid: the region model and the window experts' (alpha, b~)
         are applied to the child-resolution DA3, so the detail comes from DA3, not from
-        upsampling the parent prediction. Sigma / weights / flags are nearest-upsampled."""
+        upsampling the parent prediction. Sigma / weights / flags are nearest-upsampled.
+        The GRU expert's field is applied the same way; that one copy keeps its gradient
+        (``out.gru_child_u``, the child-resolution loss), the returned prior is detached."""
+        with torch.no_grad():
+            pri, xc, x_up, vc = self._lift(out, child_hw, mono_depth, mono_valid, vmin, vmax)
+        if out.gru_bt is not None:
+            up = lambda t_: upsample_nearest(t_.float(), child_hw)
+            u_g = xc + up(out.gru_bt) + up(out.gru_alpha) * (xc - x_up)
+            out.gru_child_u, out.gru_child_valid = u_g, vc
+            valid = torch.cat([pri["valid"], vc.float()], dim=1)
+            pri["mu"] = torch.cat([pri["mu"], u_g.detach()], dim=1)
+            pri["valid"] = valid
+            pri["w"] = normalized_weights(up(out.prior_w), valid)
+        return pri
+
+    def _lift(self, out, child_hw, mono_depth, mono_valid, vmin, vmax):
         B = mono_depth.shape[0]
         zc = sample_at_feature_pixels(mono_depth.float(), child_hw)
         mvc = (sample_at_feature_pixels(mono_valid.float(), child_hw) > 0.5) & torch.isfinite(zc) & (zc > 0)
@@ -323,8 +392,8 @@ class LAPECascade(nn.Module):
         mu_w = xc + up(out.win_bt) + up(out.win_alpha) * (xc - x_up)
         mu = torch.cat([xc, mu_w], dim=1)
         valid = torch.cat([vc.float(), up(out.win_valid) * vc.float()], dim=1)
-        w = normalized_weights(up(out.prior_w), valid)
+        w = normalized_weights(up(out.prior_w[:, :NUM_MONO]), valid)
         return {"mu": mu, "sigma": up(out.sigma.detach()), "w": w, "valid": valid,
                 "z_rac": z, "z_valid": vc, "delta": up(out.rac_delta), "split": up(out.rac_split),
                 "lfr_flag": up(out.lfr_flag) if out.lfr_flag is not None else torch.zeros_like(xc),
-                "lfr_soft": up(out.lfr_soft) if out.lfr_soft is not None else torch.zeros_like(xc)}
+                "lfr_soft": up(out.lfr_soft) if out.lfr_soft is not None else torch.zeros_like(xc)}, xc, x_up, vc

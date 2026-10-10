@@ -1,6 +1,8 @@
 """Loss for MoAMVSNet (MoA.md §11).
 
     L = sum_s w_s CE_s  +  sum_{s=2..4} lam_s (w_c L_center + w_sh L_shape + w_r L_conf)
+        + LAPE: sigma NLL + prior-mixture NLL + GRU sequence / child-res / TV
+        + refine: full-res sequence loss + confidence BCE
 
 CE_s is the two-bin soft-label CE of each MVS stage, restricted to pixels whose
 GT lies inside that stage's window (a GT outside the window has no correct bin;
@@ -15,6 +17,9 @@ import torch.nn.functional as F
 from base.config_moa import MoALossConfig
 from losses.depth_loss import soft_label_cross_entropy
 from models.moa.geometry import depth_to_u, sample_at_feature_pixels, u_to_depth
+from models.moa.prior_evidence import normalized_weights
+
+MONO_NAMES = ("rac", "w3", "w7", "w11", "gru")
 
 
 def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
@@ -26,6 +31,30 @@ def _gt_at(gt: torch.Tensor, mask: torch.Tensor, hw) -> tuple[torch.Tensor, torc
     g = sample_at_feature_pixels(gt.unsqueeze(1), hw)
     m = sample_at_feature_pixels(mask.float().unsqueeze(1), hw) > 0.5
     return g, m & (g > 0)
+
+
+def _smooth_l1(res: torch.Tensor) -> torch.Tensor:
+    return F.smooth_l1_loss(res, torch.zeros_like(res), reduction="none")
+
+
+def _shape_loss(pred_u, u_gt, g, m, tau: float, dg: float) -> torch.Tensor:
+    """Gradient matching in u (stage-1 bins), excluding GT depth discontinuities."""
+    gxc = pred_u[..., :, 1:] - pred_u[..., :, :-1]
+    gyc = pred_u[..., 1:, :] - pred_u[..., :-1, :]
+    gxg = u_gt[..., :, 1:] - u_gt[..., :, :-1]
+    gyg = u_gt[..., 1:, :] - u_gt[..., :-1, :]
+    lg = torch.where(m, g, torch.ones_like(g)).log()
+    mx = m[..., :, 1:] & m[..., :, :-1] & ((lg[..., :, 1:] - lg[..., :, :-1]).abs() < tau)
+    my = m[..., 1:, :] & m[..., :-1, :] & ((lg[..., 1:, :] - lg[..., :-1, :]).abs() < tau)
+    hx = _smooth_l1((gxc - gxg) / dg)
+    hy = _smooth_l1((gyc - gyg) / dg)
+    return ((hx * mx).sum() + (hy * my).sum()) / (mx.sum() + my.sum()).clamp_min(1)
+
+
+def _tv(f: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    tx = (f[..., :, 1:] - f[..., :, :-1]).abs() * w[..., :, 1:] * w[..., :, :-1]
+    ty = (f[..., 1:, :] - f[..., :-1, :]).abs() * w[..., 1:, :] * w[..., :-1, :]
+    return (tx.sum() + ty.sum()) / (w.sum() * 2).clamp_min(1.0)
 
 
 class MoALoss:
@@ -95,6 +124,50 @@ class MoALoss:
             l_nll = (nll * vm).sum() / vm.sum().clamp_min(1)
             total = total + cfg.w_sigma_nll * l_nll
             logs[f"{key}_nll"] = l_nll.detach()
+
+            # prior-mixture NLL: trains the monocular weights the bin mass uses (detached
+            # experts / sigmas; level 0 has no centre loss, so this is its only signal)
+            if cfg.w_prior_mix > 0 and lo.mixture_weights_raw.shape[1] == lo.mu.shape[1] + 1:
+                ev = lo.expert_valid > 0.5
+                w = normalized_weights(lo.mixture_weights_raw[:, 1:], ev.float())
+                sbd = (lo.sigma.detach() / dg).clamp_min(1e-3)
+                zz = (res / sbd).clamp(-c, c)
+                logp = torch.log(w.clamp_min(1e-8)) - 0.5 * zz * zz - torch.log(sbd)
+                logp = torch.where(ev, logp, torch.full_like(logp, -1e4))
+                mm = m & ev.any(dim=1, keepdim=True)
+                l_mix = _masked_mean(-torch.logsumexp(logp, dim=1, keepdim=True), mm)
+                total = total + cfg.w_prior_mix * l_mix
+                logs[f"{key}_mixnll"] = l_mix.detach()
+
+            # LAPE-GRU: sequence loss + shape at the parent grid, the child-res field, smoothness
+            if getattr(lo, "gru_seq", None):
+                gv = m & (lo.mono_valid > 0.5)
+                T = len(lo.gru_seq)
+                cap = cfg.sigma_nll_cap_bins
+                l_seq = sum(cfg.gru_gamma ** (T - 1 - t)
+                            * _masked_mean(_smooth_l1(((xt - u_gt) / dg).clamp(-cap, cap)), gv)
+                            for t, xt in enumerate(lo.gru_seq))
+                l_seq = l_seq + cfg.w_shape * _shape_loss(lo.gru_seq[-1], u_gt, g, gv, cfg.gt_edge_tau, dg)
+                ok = (lo.mono_valid > 0.5) & (lo.edge < 0.5)
+                l_tv = _tv(lo.gru_alpha, ok.float()) + _tv(lo.gru_bt / dg, ok.float())
+                total = total + cfg.w_gru * l_seq + cfg.w_gru_tv * l_tv
+                logs[f"{key}_gru"] = l_seq.detach()
+                logs[f"{key}_gru_tv"] = l_tv.detach()
+                if diagnostics:
+                    with torch.no_grad():
+                        logs[f"{key}_gru_err0_mm"] = _masked_mean(
+                            (u_to_depth(lo.gru_x0, vmin, vmax) - g).abs(), gv)
+                        logs[f"{key}_gru_errT_mm"] = _masked_mean(
+                            (u_to_depth(lo.gru_seq[-1], vmin, vmax) - g).abs(), gv)
+            if getattr(lo, "gru_child_u", None) is not None and getattr(lo, "gru_seq", None):
+                hc = tuple(lo.gru_child_u.shape[-2:])
+                gc, mc = _gt_at(gt, mask, hc)
+                uc = depth_to_u(torch.where(mc, gc, torch.ones_like(gc)), vmin, vmax)
+                mc = mc & lo.gru_child_valid
+                cap = cfg.sigma_nll_cap_bins
+                l_child = _masked_mean(_smooth_l1(((lo.gru_child_u - uc) / dg).clamp(-cap, cap)), mc)
+                total = total + cfg.w_gru_child * l_child
+                logs[f"{key}_gru_child"] = l_child.detach()
             if key == "lape1":
                 target = torch.exp(-(lo.mvs_u - u_gt).abs() / (lo.du + 1e-8)).detach()
                 l_conf = _masked_mean(F.binary_cross_entropy_with_logits(
@@ -116,16 +189,7 @@ class MoALoss:
             l_center = _masked_mean(
                 F.smooth_l1_loss((mo.center_u - u_gt) / dg, torch.zeros_like(u_gt), reduction="none"), m)
 
-            gxc = mo.center_u[..., :, 1:] - mo.center_u[..., :, :-1]
-            gyc = mo.center_u[..., 1:, :] - mo.center_u[..., :-1, :]
-            gxg = u_gt[..., :, 1:] - u_gt[..., :, :-1]
-            gyg = u_gt[..., 1:, :] - u_gt[..., :-1, :]
-            lg = torch.where(m, g, torch.ones_like(g)).log()
-            mx = m[..., :, 1:] & m[..., :, :-1] & ((lg[..., :, 1:] - lg[..., :, :-1]).abs() < cfg.gt_edge_tau)
-            my = m[..., 1:, :] & m[..., :-1, :] & ((lg[..., 1:, :] - lg[..., :-1, :]).abs() < cfg.gt_edge_tau)
-            hx = F.smooth_l1_loss((gxc - gxg) / dg, torch.zeros_like(gxg), reduction="none")
-            hy = F.smooth_l1_loss((gyc - gyg) / dg, torch.zeros_like(gyg), reduction="none")
-            l_shape = ((hx * mx).sum() + (hy * my).sum()) / (mx.sum() + my.sum()).clamp_min(1)
+            l_shape = _shape_loss(mo.center_u, u_gt, g, m, cfg.gt_edge_tau, dg)
 
             target = torch.exp(-(mo.mvs_u - u_gt).abs() / (mo.du + 1e-8)).detach()
             l_conf = _masked_mean(F.binary_cross_entropy_with_logits(
@@ -147,12 +211,33 @@ class MoALoss:
                     logs[p + "err_mvs_mm"] = _masked_mean(e_m, m)
                     logs[p + "better_frac"] = _masked_mean((e_c < e_m).float(), m)
                     logs[p + "override_rate"] = (mo.alpha > 0.5).float().mean()
-                    for j, name in enumerate(("mvs", "rac", "w3", "w7", "w11")):
+                    for j, name in enumerate(("mvs",) + MONO_NAMES[:mo.mixture_weights.shape[1] - 1]):
                         logs[p + f"pi_{name}"] = mo.mixture_weights[:, j].mean()
                     if mo.lfr_flag is not None:
                         f = mo.lfr_flag & m
                         logs[p + "lfr_rate"] = mo.lfr_flag.float().mean()
                         logs[p + "lfr_good"] = ((e_c < e_m) & f).float().sum() / f.float().sum().clamp_min(1)
+
+        rf = outputs.get("refine")
+        if rf is not None and rf["seq"]:
+            hw = tuple(rf["u0"].shape[-2:])
+            g, m = _gt_at(gt, mask, hw)
+            u_gt = depth_to_u(torch.where(m, g, torch.ones_like(g)), vmin, vmax)
+            du = rf["du"].clamp_min(1e-8)
+            T = len(rf["seq"])
+            # the refinement moves at most T spacings: pixels farther off are the cascade's job
+            reach = m & ((rf["u0"] - u_gt).abs() <= cfg.refine_cap * du)
+            l_ref = sum(cfg.gru_gamma ** (T - 1 - t) * _masked_mean(_smooth_l1((ut - u_gt) / du), reach)
+                        for t, ut in enumerate(rf["seq"]))
+            target = torch.exp(-(rf["u"].detach() - u_gt).abs() / du)
+            l_rc = _masked_mean(F.binary_cross_entropy_with_logits(rf["conf_logit"], target, reduction="none"), m)
+            total = total + cfg.w_refine * l_ref + cfg.w_refine_conf * l_rc
+            logs["refine"] = l_ref.detach()
+            logs["refine_conf"] = l_rc.detach()
+            if diagnostics:
+                with torch.no_grad():
+                    logs["refine_err0_mm"] = _masked_mean((u_to_depth(rf["u0"], vmin, vmax) - g).abs(), m)
+                    logs["refine_errT_mm"] = _masked_mean((rf["depth"] - g).abs(), m)
 
         logs["loss"] = total.detach()
         return total, logs
@@ -162,7 +247,7 @@ class MoALoss:
 def lape_diagnostics(lo, g, m, u_gt, vmin, vmax, key: str, dg: float) -> dict[str, torch.Tensor]:
     """Per monocular expert: error, sigma calibration (mean z^2, share within 1 sigma); RAC state."""
     out = {}
-    for j, name in enumerate(("rac", "w3", "w7", "w11")):
+    for j, name in enumerate(MONO_NAMES[:lo.mu.shape[1]]):
         vm = (lo.expert_valid[:, j:j + 1] > 0.5) & m
         e = (u_to_depth(lo.mu[:, j:j + 1], vmin, vmax) - g).abs()
         z = (lo.mu[:, j:j + 1] - u_gt) / lo.sigma[:, j:j + 1].clamp_min(1e-8)

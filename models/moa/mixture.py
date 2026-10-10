@@ -19,14 +19,15 @@ NUM_EXPERTS = 5
 
 
 class MixtureHead(nn.Module):
-    def __init__(self, in_ch: int, hidden: int = 32, mvs_bias_init: float = 1.0) -> None:
+    def __init__(self, in_ch: int, hidden: int = 32, mvs_bias_init: float = 1.0,
+                 n_experts: int = NUM_EXPERTS) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, hidden, 3, padding=1, bias=False),
             nn.GroupNorm(min(8, hidden), hidden), nn.SiLU(),
             nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
             nn.GroupNorm(min(8, hidden), hidden), nn.SiLU(),
-            nn.Conv2d(hidden, NUM_EXPERTS, 1),
+            nn.Conv2d(hidden, n_experts, 1),
         )
         with torch.no_grad():
             last = self.net[-1]
@@ -34,7 +35,7 @@ class MixtureHead(nn.Module):
             last.bias[0] = float(mvs_bias_init)
 
     def forward(self, feats: torch.Tensor, expert_valid: torch.Tensor) -> torch.Tensor:
-        """feats [B,C,H,W], expert_valid [B,5,H,W] (column 0 forced valid) -> pi [B,5,H,W]."""
+        """feats [B,C,H,W], expert_valid [B,J,H,W] (column 0 forced valid) -> pi [B,J,H,W]."""
         logits = self.net(feats.float())
         valid = expert_valid.bool().clone()
         valid[:, 0] = True

@@ -631,13 +631,16 @@ def _run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
             if m is not None:
                 m.requires_grad_(False)
     moa_ids = {id(p) for p in model.moa.parameters()} if model.moa is not None else set()
+    ref_ids = {id(p) for p in model.refiner.parameters()} if model.refiner is not None else set()
     params = {
-        "backbone": [p for p in model.parameters() if p.requires_grad and id(p) not in moa_ids],
+        "backbone": [p for p in model.parameters() if p.requires_grad and id(p) not in moa_ids | ref_ids],
         "moa": [p for p in model.parameters() if p.requires_grad and id(p) in moa_ids],
+        "refine": [p for p in model.parameters() if p.requires_grad and id(p) in ref_ids],
     }
-    all_params = params["backbone"] + params["moa"]
+    all_params = params["backbone"] + params["moa"] + params["refine"]
     print(f"[model] trainable backbone {sum(p.numel() for p in params['backbone']) / 1e6:.2f}M + "
-          f"MoA {sum(p.numel() for p in params['moa']) / 1e6:.3f}M params, "
+          f"MoA {sum(p.numel() for p in params['moa']) / 1e6:.3f}M + "
+          f"refine {sum(p.numel() for p in params['refine']) / 1e6:.3f}M params, "
           f"moa={'on' if model.moa is not None else 'off'} lape={'on' if model.lape_on else 'off'} "
           f"feat={cfg.feat.backbone} sva_full={cfg.sva.full}")
     optimizer = torch.optim.AdamW(all_params, lr=t.lr, weight_decay=t.weight_decay)
