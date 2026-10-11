@@ -246,8 +246,9 @@ class MoATrainConfig:
     # LAPE training-time prior augmentation (per sample, train mode only):
     # drop the whole monocular prior, or perturb one 64x64 block of the DA3 depth
     # (scale +-10%, shift +-2% of the block median) before RAC sees it.
-    prior_dropout: float = 0.3
-    mono_perturb: float = 0.3
+    # LAPE-GRU: both off — the prior is used as DA3 gives it, never dropped or perturbed.
+    prior_dropout: float = 0.0
+    mono_perturb: float = 0.0
 
 
 def _train_profile(profile: str) -> MoATrainConfig:

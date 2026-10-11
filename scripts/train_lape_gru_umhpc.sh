@@ -27,6 +27,7 @@
 #   * 末级精修 (models/moa/refine.py): 1/2 分辨率 ConvGRU 4 步, 每步在当前深度附近重做 5 候选
 #     plane sweep, 残差凸上采样回全分辨率 -> depth_full; 另输出 conf_refine;
 #   * 关闭低频回拉 (lape.lfr=False), 取消单目权重上限 (moa.moa_gain=(1,1,1));
+#   * 关闭先验训练增强: 不整体丢弃先验 (train.prior_dropout=0), 不扰动 DA3 块 (train.mono_perturb=0);
 #   * 新损失: GRU 序列损失 + 子分辨率损失 + 边缘感知 TV, 先验混合 NLL, 精修序列损失 + 置信度 BCE。
 #   必须从 step 0 训练 (混合头变成 6 路, 旧 LAPE checkpoint 不能续训)。
 #
