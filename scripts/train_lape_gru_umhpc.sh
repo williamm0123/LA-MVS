@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --qos=long
 #SBATCH --time=3-00:00:00
@@ -13,10 +13,10 @@
 #SBATCH --error=logs/%x_%j.err
 
 # =============================================================================
-# LAPE-GRU —— DTU 从头训练 10 个 epoch (双卡 A100-80GB, 单节点 DDP, sbatch 提交)。
+# LAPE-GRU —— DTU 从头训练 10 个 epoch (umhpc 单卡 A100-80GB, sbatch 提交)。
 #
 #   cd <本 checkout 的根目录> && git checkout dev && git pull && mkdir -p logs
-#   sbatch scripts/train_lape_gru_umhpc.sh                    # LAPE_GRU_DTU_E10, 每卡 batch 2 / 全局 batch 4
+#   sbatch scripts/train_lape_gru_umhpc.sh                    # LAPE_GRU_DTU_E10, 单卡 batch 2
 #   EPOCHS=1 RUN_NAME=LAPE_GRU_E1 sbatch scripts/train_lape_gru_umhpc.sh   # 先跑 1 个 epoch 看速度
 #
 # 相对 LAPE (scripts/train_lape_umhpc.sh) 的改动 (全部是 base/config_moa.py 的默认值, 无需额外参数):
@@ -30,9 +30,9 @@
 #   * 新损失: GRU 序列损失 + 子分辨率损失 + 边缘感知 TV, 先验混合 NLL, 精修序列损失 + 置信度 BCE。
 #   必须从 step 0 训练 (混合头变成 6 路, 旧 LAPE checkpoint 不能续训)。
 #
-# 双卡: torchrun 每卡一个进程; 每卡 batch 2, 全局 batch 4, lr 3e-4 @ batch 2 按 sqrt 缩放 -> 4.243e-4。
-#   NUM_WORKERS=12 是每进程的 worker 数; 验证 batch 4 也是每卡值。速度/显存以日志为准
-#   (旧 LAPE 双卡约 3.14 s/step, 10 epoch 67,740 步 ~59 h; GRU + 精修会再慢一些)。
+# 单卡: 普通 python 进程 (不经 torchrun, 超时退出码 124 才能原样传回); batch 2, lr 3e-4
+#   (与 moa1 同一口径)。每 epoch 13,548 步, 10 epoch 135,480 步, 远超 3 天时限, 靠自动续投接力。速度/显存以日志为准
+#   速度/显存以日志 eta 为准 (旧 LAPE 双卡 3.14 s/step 供参考)。
 #
 # 超时自动续投: slurm 在超时前 15 分钟发 USR1, 所有 rank 跑完当前 step 后同步保存 latest.pth 并退出;
 #   脚本识别 stop-file 后以 FRESH=0 重投本脚本。手动续训: FRESH=0 sbatch scripts/train_lape_gru_umhpc.sh
@@ -55,12 +55,12 @@ RUN_NAME=${RUN_NAME:-LAPE_GRU_DTU_E10}
 EPOCHS=${EPOCHS:-10}
 STEPS=${STEPS:-0}                        # >0 则按步数跑 (覆盖 EPOCHS); 0 = 按 EPOCHS
 WARP_CHANNELS=${WARP_CHANNELS:-128,128,128,128}
-NPROC=2                                 # 单节点双卡, 一卡一个训练进程
+NPROC=1                                 # 单卡
 PER_GPU_BATCH=${PER_GPU_BATCH:-2}
 GLOBAL_BATCH=$((NPROC * PER_GPU_BATCH))
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-4}
 NUM_VIEWS=${NUM_VIEWS:-5}
-NUM_WORKERS=${NUM_WORKERS:-12}
+NUM_WORKERS=${NUM_WORKERS:-8}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
 VAL_INTERVAL=${VAL_INTERVAL:-5000}       # 另外每个 epoch 末都验证一次
 CKPT_INTERVAL=${CKPT_INTERVAL:-1000}
@@ -70,7 +70,7 @@ DETERMINISTIC=${DETERMINISTIC:-1}
 DA3_RES=${DA3_RES:-518}
 FRESH=${FRESH:-1}                        # 1 = 新 run (归档同名旧目录, --resume off); 0 = 续训
 CHAIN=${CHAIN:-0}
-MAX_CHAIN=${MAX_CHAIN:-4}
+MAX_CHAIN=${MAX_CHAIN:-6}
 # lr: 3e-4 @ 全局 batch 2, 按 sqrt 缩放 (与 train_moa_umhpc.sh 同一规则)
 LR_REF=${LR_REF:-3e-4}
 LR_REF_BATCH=${LR_REF_BATCH:-2}
@@ -120,13 +120,13 @@ python - "$PER_GPU_BATCH" "$NPROC" <<'PY' || exit 1
 import sys, torch
 from base.config import ProjectPaths
 if not torch.cuda.is_available() or torch.cuda.device_count() < int(sys.argv[2]):
-    sys.exit("需要两张可见 GPU —— 这个作业需要 --gres=gpu:2")
+    sys.exit("没有可见 GPU —— 这个作业需要 --gres=gpu:1")
 for i in range(int(sys.argv[2])):
     prop = torch.cuda.get_device_properties(i)
     gib = prop.total_memory / 2**30
     print(f"=== GPU {i}: {prop.name}  {gib:.0f} GiB ===")
     if "A100" not in prop.name or gib < 70:
-        sys.exit(f"GPU {i} 是 {prop.name} / {gib:.0f} GiB; 本脚本要求两张 A100 80GB")
+        sys.exit(f"GPU {i} 是 {prop.name} / {gib:.0f} GiB; 本脚本要求 A100 80GB")
 w = ProjectPaths().da3_weights_file
 if not (w / "model.safetensors").is_file():
     sys.exit(f"DA3 权重不在 {w} (需要 config.json + model.safetensors)")
@@ -165,8 +165,7 @@ fi
 STOP_FILE=$(mktemp "$PROJECT_DIR/logs/lape_gru_stop_${SLURM_JOB_ID:-manual}.XXXXXX")
 rm -f "$STOP_FILE"
 trap 'echo "=== 收到超时信号, 请求所有 rank 存档 ==="; touch "$STOP_FILE"' USR1 TERM
-python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node="$NPROC" --max-restarts=0 \
-    train_moa.py "${args[@]}" --stop-file "$STOP_FILE" &
+python train_moa.py --device cuda:0 "${args[@]}" --stop-file "$STOP_FILE" &
 PID=$!
 set +e
 wait "$PID"
