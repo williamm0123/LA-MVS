@@ -246,7 +246,7 @@ class LAPECascade(nn.Module):
         for j in range(NUM_MONO):
             sj, fj = calibrated_sigma(self.calibrators[level][j], s_list[j], p_list[j], d_list[j],
                                       n_list[j], edge_bin, f_list[j], dg, lc.delta0, lc.sigma_floor_bins,
-                                      r=r_anchor, r_img=r_img)
+                                      r=r_anchor, r_img=r_img, use_cal=lc.sigma_calibrator)
             sig.append(sj)
             feats.append(fj)
         sigma = torch.cat(sig, dim=1)

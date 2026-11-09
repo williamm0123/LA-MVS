@@ -51,8 +51,9 @@ class SigmaCalibrator(nn.Module):
 def calibrated_sigma(cal: SigmaCalibrator, s_ho: torch.Tensor, sigma_par: torch.Tensor,
                      delta: torch.Tensor, n_eff: torch.Tensor, edge: torch.Tensor, flag: torch.Tensor,
                      du_global: float, delta0: float, floor_bins: float, r: torch.Tensor | None = None,
-                     r_img: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """All [B,1,H,W] (detached inputs). Returns (sigma, features) in u units."""
+                     r_img: torch.Tensor | None = None, use_cal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """All [B,1,H,W] (detached inputs). Returns (sigma, features) in u units.
+    ``use_cal=False``: the analytic s_base (+ floor) only, the calibrator is not applied (ablation B4)."""
     if r is None:
         r = torch.ones_like(s_ho)
     if r_img is None:
@@ -65,6 +66,6 @@ def calibrated_sigma(cal: SigmaCalibrator, s_ho: torch.Tensor, sigma_par: torch.
         torch.log1p(n_eff.detach().float()), edge.detach().float(), flag.detach().float(),
         r.detach().float().expand_as(s_ho), r_img.detach().float().expand_as(s_ho)], dim=1)
     base = (s_ho * s_ho + sp * sp).sqrt()
-    sig = base * torch.exp(cal(feats).clamp(-6.0, 6.0))
+    sig = base * torch.exp(cal(feats).clamp(-6.0, 6.0)) if use_cal else base
     sig = (sig * sig + (floor_bins * d1) ** 2).sqrt()
     return sig, feats

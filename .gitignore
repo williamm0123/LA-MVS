@@ -53,6 +53,7 @@ slurm-*.err
 *.csv
 *.yml
 !docs/current_code_dataflow_guide_zh.md
+!scripts/ablation/README.md
 # Local generated visualizations
 /depth_map_000_vis.png
 

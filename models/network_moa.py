@@ -119,14 +119,15 @@ class MoAMVSNet(nn.Module):
             self.prior_adapters = nn.ModuleList(PriorAdapter(cc.num_groups) for _ in range(4))
             self.gamma_heads = nn.ModuleList(
                 GammaHead(gamma_max=lc.gamma_max, bias_init=lc.gamma_bias_init) for _ in range(4))
-            if lc.refine:
-                from models.moa.refine import DepthRefiner
-                self.refiner = DepthRefiner(fpn_c, cc.num_groups, warp_channels=lc.refine_warp_channels,
-                                            hidden=lc.refine_hidden, radius=lc.refine_radius,
-                                            iters=lc.refine_iters, use_half=cc.warp_use_half)
         elif self.cfg.moa.enabled:
             from models.moa.moa import MoACascade
             self.moa = MoACascade(self.cfg.moa, fpn_c, cc.num_groups, cc.num_depths[0])
+        lc = self.cfg.lape
+        if lc.refine and (self.lape_on or (self.moa is None and lc.refine_without_prior)):
+            from models.moa.refine import DepthRefiner
+            self.refiner = DepthRefiner(fpn_c, cc.num_groups, warp_channels=lc.refine_warp_channels,
+                                        hidden=lc.refine_hidden, radius=lc.refine_radius,
+                                        iters=lc.refine_iters, use_half=cc.warp_use_half)
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -223,7 +224,8 @@ class MoAMVSNet(nn.Module):
         from models.moa.low_freq_recall import texture_ratio
         from models.moa.normal_evidence import camera_normals
         from models.moa.prior_evidence import (
-            bin_mass, evidence_channels, log_prior, mixture_moments, posterior_features, reliable_mvs,
+            bin_mass, density_log_mass, evidence_channels, log_prior, mixture_moments, posterior_features,
+            reliable_mvs,
         )
         lc, mcfg = self.cfg.lape, self.cfg.moa
         G = self.cfg.cascade.num_groups
@@ -231,6 +233,8 @@ class MoAMVSNet(nn.Module):
         hw = tuple(cv.shape[-2:])
         du_k = axis_spacing(u_hyp)
         store: dict = {}
+        if not lc.reliability_gate:                 # ablation B6: v_M == 0
+            vM_parent = torch.zeros_like(vM_parent)
 
         # (3) normal-consistent evidence
         delta_n = torch.zeros_like(cv)
@@ -249,12 +253,18 @@ class MoAMVSNet(nn.Module):
             store["nce_gate"] = gate_n.detach()
 
         # (5) prior mass on this axis
-        q, M = bin_mass(u_hyp, pri["mu"], pri["sigma"], pri["w"])
-        ell, active = log_prior(q, M, lc.mass_min, lc.eps_floor, lc.log_prior_clip)
+        if lc.prior_mass == "density":              # ablation B5: pdf at the centres, renormalised, no gate
+            q, has = density_log_mass(u_hyp, pri["mu"], pri["sigma"], pri["w"])
+            M = has.float()
+            ell, _ = log_prior(q, M, 0.0, lc.eps_floor, lc.log_prior_clip)
+            ell, active = ell * M, has
+        else:
+            q, M = bin_mass(u_hyp, pri["mu"], pri["sigma"], pri["w"])
+            ell, active = log_prior(q, M, lc.mass_min, lc.eps_floor, lc.log_prior_clip)
         mbar, sbar = mixture_moments(pri["mu"], pri["sigma"], pri["w"])
         E = evidence_channels(u_hyp, ell, mbar, sbar, M, active, du_k, lc.log_prior_clip)
         g_p = (active & ~vM_parent).float()
-        dC = self.prior_adapters[k](E) * g_p.unsqueeze(1)
+        dC = self.prior_adapters[k](E) * g_p.unsqueeze(1) if lc.cost_adapter else torch.zeros_like(cv)
         frac = (cvo.n_valid / max(cvo.num_src, 1)).unsqueeze(1).to(cv.dtype)
         x_in = torch.cat([cv + delta_n + dC, frac], dim=1)
 
@@ -268,6 +278,8 @@ class MoAMVSNet(nn.Module):
         def fuse(logits_raw: torch.Tensor) -> torch.Tensor:
             pf = posterior_features(logits_raw, u_hyp, src_n, nvf)
             vM = reliable_mvs(pf, lc)
+            if not lc.reliability_gate:
+                vM = torch.zeros_like(vM)
             md = ((pf["mu_u"] - mbar) / (pf["sd_u"] ** 2 + sbar ** 2).sqrt().clamp_min(1e-8)).clamp(-8.0, 8.0) / 8.0
             gin = torch.cat([pf["pmax"], pf["entropy"], pf["gap"], pf["mass1"], pf["src"].clamp(0, 10) / 10.0,
                              pf["nvalid"], lsig, M.clamp(0, 1), dlt, pri["split"], pri["lfr_soft"],

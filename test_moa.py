@@ -27,6 +27,8 @@ from torch.utils.data import DataLoader, Subset
 
 from base.config_moa import apply_arch_snapshot, build_moa_config
 from data.dtu_moa import MoADTUDataset
+from models.moa.geometry import depth_to_u, sample_at_feature_pixels
+from models.moa.prior_evidence import bin_edges
 from models.network_moa import MoAMVSNet
 from train_moa import collate, git_state, load_checkpoint, load_model_state, metric_mask
 
@@ -118,6 +120,50 @@ def cascade_confidence(outputs: dict, window: int) -> torch.Tensor:
     for s in range(1, 5):
         conf = conf * mode_mass(outputs[f"stage{s}"]["prob"], window, hw)
     return conf
+
+
+@torch.no_grad()
+def window_stats(outputs: dict, batch: dict, mask: torch.Tensor) -> dict[str, float]:
+    """Pixel sums for the coverage / selection table (paper Tab. coverage): per stage 2..4 the
+    number of valid GT pixels inside that stage's candidate interval (bin edges, i.e. half a
+    spacing beyond the end candidates), and the final depth error split by the stage-4 window."""
+    vmin, vmax = outputs["vmin"].float(), outputs["vmax"].float()
+    gt = batch["depth_gt"].float().unsqueeze(1)
+    mk = mask.float().unsqueeze(1)
+    stats: dict[str, float] = {}
+    ins4 = None
+    for s in (2, 3, 4):
+        st = outputs.get(f"stage{s}")
+        if st is None:
+            continue
+        uh = st["u_hypos"].float()
+        hw = tuple(uh.shape[-2:])
+        g = sample_at_feature_pixels(gt, hw)
+        m = sample_at_feature_pixels(mk, hw) > 0.5
+        u = depth_to_u(torch.where(m, g, torch.ones_like(g)), vmin, vmax)
+        up, lo = bin_edges(uh)
+        ins = (u <= up[:, :1]) & (u >= lo[:, -1:])
+        stats[f"cov{s}_n"] = float(m.sum())
+        stats[f"cov{s}_in"] = float((ins & m).sum())
+        if s == 4 and hw == tuple(gt.shape[-2:]):
+            ins4 = ins & m
+    if ins4 is not None:
+        m = mk > 0.5
+        err = (outputs["depth_full"].float().unsqueeze(1) - gt).abs()
+        stats["e_in_n"], stats["e_in_sum"] = float(ins4.sum()), float(err[ins4].sum())
+        out4 = m & ~ins4
+        stats["e_out_n"], stats["e_out_sum"] = float(out4.sum()), float(err[out4].sum())
+    return stats
+
+
+def window_summary(acc: dict[str, float]) -> dict[str, float]:
+    out = {f"cov{s}": acc[f"cov{s}_in"] / max(acc[f"cov{s}_n"], 1.0) for s in (2, 3, 4) if f"cov{s}_n" in acc}
+    if "e_in_n" in acc:
+        out["e_in_mm"] = acc["e_in_sum"] / max(acc["e_in_n"], 1.0)
+        out["e_out_mm"] = acc["e_out_sum"] / max(acc["e_out_n"], 1.0)
+        out["out_pixel_share"] = acc["e_out_n"] / max(acc["e_in_n"] + acc["e_out_n"], 1.0)
+        out["out_error_share"] = acc["e_out_sum"] / max(acc["e_in_sum"] + acc["e_out_sum"], 1e-12)
+    return out
 
 
 class ScanMeter:
@@ -250,6 +296,7 @@ def main(argv=None) -> None:
                         collate_fn=collate, pin_memory=True)
     meter = ScanMeter()
     moa_stats: dict[str, float] = defaultdict(float)
+    win_acc: dict[str, float] = defaultdict(float)
     for i, batch in enumerate(loader):
         selected_idx = todo_indices[i]
         scan, _light, ref_view, src_views = ds.metas[selected_idx]
@@ -264,6 +311,8 @@ def main(argv=None) -> None:
         m = metric_mask(batch) & (batch["depth_gt"] > 0)
         if m.any():
             meter.update(scan, (pred[m] - batch["depth_gt"].float()[m]).abs())
+        for k, v in window_stats(out, batch, m).items():
+            win_acc[k] += v
         for s in (2, 3, 4):
             mo = out.get(f"moa{s}")
             if mo is not None:
@@ -300,7 +349,8 @@ def main(argv=None) -> None:
 
     n = max(len(todo_indices), 1)
     summary = {"overall": meter.overall(), "per_scan": meter.per_scan(),
-               "moa": {k: v / n for k, v in moa_stats.items()}}
+               "moa": {k: v / n for k, v in moa_stats.items()},
+               "window": window_summary(win_acc)}
     if cached_views:
         summary["coverage"] = {"selected_views": selected_views,
                                "newly_inferred_views": len(todo_indices),

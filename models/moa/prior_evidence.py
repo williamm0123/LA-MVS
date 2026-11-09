@@ -64,6 +64,21 @@ def bin_mass(u_hyp: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor,
     return q.clamp_min(0.0), q.sum(dim=1, keepdim=True)
 
 
+def density_log_mass(u_hyp: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor,
+                     w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ablation B5 (the simple-fusion baseline): the mixture pdf at the candidate centres,
+    renormalised over the window — no bin integral, no in-window mass. Returns (q [B,D,H,W]
+    summing to 1 per pixel, has_prior [B,1,H,W] bool)."""
+    u = u_hyp.float()
+    terms = []
+    for j in range(mu.shape[1]):
+        s = sigma[:, j:j + 1].float().clamp_min(1e-8)
+        z = (u - mu[:, j:j + 1].float()) / s
+        terms.append(w[:, j:j + 1].float().clamp_min(1e-12).log() - s.log() - 0.5 * z * z)
+    logq = torch.logsumexp(torch.stack(terms, 0), dim=0)
+    return F.softmax(logq, dim=1), w.sum(dim=1, keepdim=True) > 1e-6
+
+
 def mixture_moments(mu: torch.Tensor, sigma: torch.Tensor, w: torch.Tensor):
     m = (w * mu.float()).sum(1, keepdim=True)
     second = (w * (sigma.float() ** 2 + mu.float() ** 2)).sum(1, keepdim=True)

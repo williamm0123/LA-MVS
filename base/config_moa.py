@@ -191,6 +191,14 @@ class LAPEConfig:
     refine_hidden: int = 64
     refine_radius: int = 2
     refine_warp_channels: int = 32
+    # (8) ablation switches (ablation.py, scripts/ablation/README.md); the defaults are the full model.
+    prior_mass: str = "bin"                     # bin: mass over the candidate bins + M_min gate;
+    #                                             density: mixture pdf at the candidate centres,
+    #                                             renormalised over the window, no mass gate (B5)
+    reliability_gate: bool = True               # False: v_M == 0, the prior acts everywhere (B6)
+    cost_adapter: bool = True                   # False: no prior evidence before the 3D UNet (B7)
+    sigma_calibrator: bool = True               # False: analytic sigma = sqrt(s_ho^2 + sigma_par^2) (B4)
+    refine_without_prior: bool = False          # build the refiner with moa.enabled = False (A0-R)
 
 
 @dataclass(frozen=True)
