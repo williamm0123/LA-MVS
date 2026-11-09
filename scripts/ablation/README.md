@@ -8,8 +8,10 @@
 1. **FULL = 当前 `dev` 的默认配置**：LAPE + LAPE-GRU + 1/2 分辨率精修，LFR 关，`moa_gain=(1,1,1)`，
    先验训练增强关。它的 seed #1 就是已有的 `LAPE_GRU_DTU_E10` (`scripts/train_lape_gru_umhpc.sh`)。
    如果最终论文模型改了 (例如退回 E10 LAPE)，所有 B 行都要相对新的 FULL 重跑。
-2. **第 0 层混合权重拿不到梯度** (`main.tex` 开头的 AUTHOR NOTES) 目前**没有修**。若要修，先修再投，
-   否则修完后所有带先验的行都要重跑。
+2. **第 0 层混合权重拿不到梯度** (`main.tex` 开头的 AUTHOR NOTES) 只存在于 E10 代码 (`0e0d057`)。
+   LAPE-GRU 提交 `301dbc6` 加了先验混合 NLL (`loss.w_prior_mix`, 日志 `lape1_mixnll`)，它是第 0 层混合头
+   的训练信号；2026-11-10 在真实 DTU 样本上做反传确认 `adapters.0.mixture` 有梯度。FULL 和全部消融预设都已包含。
+   初始化时 RAC 常对齐失败 (`x_valid=0`)，个别样本上某一层没有梯度属正常，不是 bug。
 3. 论文表 6 的 A4 数字 (0.304/0.281/0.293) 是 E10 LAPE，不是 FULL；表里要换成 FULL 的结果。
 4. 所有行共用：DA3 特征 (A0FPN 除外)、单卡 A100-80GB、batch 2、lr 3e-4、warmup 1000、
    warp 128x4、multi-scale、bf16、deterministic、10 epoch (13,548 步/epoch)、同一 DTU train 列表。
