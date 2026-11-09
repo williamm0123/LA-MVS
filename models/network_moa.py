@@ -4,6 +4,8 @@
     cfg.feat.backbone = "da3" (default): Depth Anything 3's encoder tokens feed the SVA in
       place of DINOv3 (MonoMVSNet's recipe), and its DPT head gives the reference view's
       monocular depth online — no DA3 cache. "dinov3": moa1 / moa2 checkpoints.
+      "none": plain FPN, no frozen ViT at all (pure-MVS ablation, needs moa.enabled = False).
+    Without the monocular prior (moa.enabled = False) DA3's DPT head is not run.
 
     LAPE (cfg.lape.enabled, default):
       stage 1, pass A: full-range axis, cost volume + 3D UNet (pure matching)
@@ -63,13 +65,16 @@ class MoAMVSNet(nn.Module):
         if self.backbone_kind == "da3":
             from models.da3_feature import DA3SVA
             self.da3_sva = DA3SVA(self.cfg.feat, self.cfg.dino_fusion, self.cfg.paths.da3_weights_file,
-                                  fpn_c, self.cfg.sva, net=da3_net)
+                                  fpn_c, self.cfg.sva, net=da3_net, with_head=bool(self.cfg.moa.enabled))
         elif self.backbone_kind == "dinov3":
             from models.spre import DinoSVA
             self.dino_sva = DinoSVA(self.cfg.dino_fusion, self.cfg.dino, self.cfg.paths.dinov3_weights_file,
                                     fpn_channels=fpn_c, sva_cfg=self.cfg.sva)
+        elif self.backbone_kind == "none":
+            if self.cfg.moa.enabled:
+                raise ValueError("feat.backbone = none has no monocular depth: needs moa.enabled = False")
         else:
-            raise ValueError(f"feat.backbone must be da3 / dinov3, got {self.backbone_kind!r}")
+            raise ValueError(f"feat.backbone must be da3 / dinov3 / none, got {self.backbone_kind!r}")
         self.fpn = MultiViewFPN(out_channels=fpn_c, base_channel=self.cfg.fpn.base_channel,
                                 stage1_head="out0" if self.full_sva else "smooth")
         self.sva_pathway = None
@@ -142,10 +147,12 @@ class MoAMVSNet(nn.Module):
         if self.da3_sva is not None:
             fused, grid, d = self.da3_sva(images)
             fpn_in = self.da3_sva.fpn_feature(fused, grid, coarse_hw)
-        else:
+        elif self.dino_sva is not None:
             fused, _, grid = self.dino_sva(images)
             fpn_in = self.dino_sva.fpn_feature(fused, grid, coarse_hw)
             d = None
+        else:
+            fpn_in = d = None
         feats = self.fpn(images, dino=fpn_in)
         if self.sva_pathway is not None:
             feats = self.sva_pathway(feats)
@@ -283,7 +290,7 @@ class MoAMVSNet(nn.Module):
         gray = (0.299 * images[:, 0, 0:1] + 0.587 * images[:, 0, 1:2] + 0.114 * images[:, 0, 2:3])
         cc = self.cfg.cascade
         out: dict = {"vmin": vmin, "vmax": vmax}
-        if d is not None:
+        if d is not None and d.depth is not None:
             out["mono_depth"] = d.depth
             out["mono_valid"] = d.valid
 

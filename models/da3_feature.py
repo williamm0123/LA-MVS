@@ -53,16 +53,20 @@ def da3_grid(H: int, W: int, process_res: int, patch: int = 14) -> tuple[int, in
 class DA3Output:
     tokens: list            # per selected layer [B, V, N, C] float32 (LayerNorm'ed, patch tokens only)
     grid: tuple             # (gh, gw) token grid
-    depth: torch.Tensor     # [B, 1, H, W] float32 reference-view relative depth (DA3 units)
-    valid: torch.Tensor     # [B, 1, H, W] bool: finite, > 0 and not sky
+    depth: torch.Tensor | None   # [B, 1, H, W] float32 reference-view relative depth (DA3 units)
+    valid: torch.Tensor | None   # [B, 1, H, W] bool: finite, > 0 and not sky (None: head skipped)
     process_hw: tuple       # (h, w) DA3 input size
 
 
 class DA3Backbone(nn.Module):
-    """Frozen DA3 (backbone + DPT head). ``net`` may be injected (tests)."""
+    """Frozen DA3 (backbone + DPT head). ``net`` may be injected (tests).
+
+    ``with_head=False`` skips the DPT head (no monocular depth is consumed: pure-MVS ablation).
+    """
 
     def __init__(self, weights_dir=None, process_res: int = 518, sky_threshold: float = 0.3,
-                 layers: tuple[int, ...] = (0, 1, 2, 3), net: nn.Module | None = None) -> None:
+                 layers: tuple[int, ...] = (0, 1, 2, 3), net: nn.Module | None = None,
+                 with_head: bool = True) -> None:
         super().__init__()
         if net is None:
             if weights_dir is None or not Path(weights_dir).exists():
@@ -77,6 +81,7 @@ class DA3Backbone(nn.Module):
         self.process_res = int(process_res)
         self.sky_threshold = float(sky_threshold)
         self.layers = tuple(int(i) for i in layers)
+        self.with_head = bool(with_head)
         self.patch = int(getattr(self.net.head, "patch_size", 14))
         self.embed_dim = int(self.net.backbone.pretrained.embed_dim)
         n_out = len(self.net.backbone.out_layers)
@@ -110,6 +115,9 @@ class DA3Backbone(nn.Module):
                             enabled=amp is not None):
             feats, _ = self.net.backbone(x, cam_token=None, export_feat_layers=[])
         gh, gw = h // self.patch, w // self.patch
+        tokens = [feats[i][0].float() for i in self.layers]           # [B, V, N, C]
+        if not self.with_head:
+            return DA3Output(tokens=tokens, grid=(gh, gw), depth=None, valid=None, process_hw=(h, w))
         # head on the reference view only, fp32 (as DA3 itself runs its heads)
         with torch.autocast(device_type=images.device.type, enabled=False):
             out = self.net.head([(f[:, :1].float(),) for f, _ in feats], h, w, patch_start_idx=0)
@@ -123,7 +131,6 @@ class DA3Backbone(nn.Module):
         if sky is not None:
             valid &= sky < self.sky_threshold
         depth = torch.where(valid, depth, torch.ones_like(depth))
-        tokens = [feats[i][0].float() for i in self.layers]           # [B, V, N, C]
         return DA3Output(tokens=tokens, grid=(gh, gw), depth=depth, valid=valid, process_hw=(h, w))
 
 
@@ -135,12 +142,12 @@ class DA3SVA(nn.Module):
     """
 
     def __init__(self, feat_cfg, fusion_cfg, weights_dir, fpn_channels: int, sva_cfg,
-                 net: nn.Module | None = None) -> None:
+                 net: nn.Module | None = None, with_head: bool = True) -> None:
         super().__init__()
         from models.spre import SVAFusion
 
         self.da3 = DA3Backbone(weights_dir, feat_cfg.process_res, feat_cfg.sky_threshold,
-                               tuple(feat_cfg.sva_layers), net=net)
+                               tuple(feat_cfg.sva_layers), net=net, with_head=with_head)
         self.fusion = SVAFusion(self.da3.embed_dim, fusion_cfg, n_layers=len(self.da3.layers))
         self.out_dim = self.fusion.out_dim
         self.full_sva = bool(sva_cfg is not None and sva_cfg.full)

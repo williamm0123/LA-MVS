@@ -112,7 +112,7 @@ class FeatureConfig:
     only for checkpoints trained before this section existed (moa1 / moa2).
     """
 
-    backbone: str = "da3"                       # da3 | dinov3 (legacy)
+    backbone: str = "da3"                       # da3 | dinov3 (legacy) | none (pure-MVS ablation)
     # DA3 input: longest side -> process_res, then each side rounded to a multiple of 14
     # (DA3's own upper_bound_resize). 518 is where its shape is best (test18).
     process_res: int = 518
